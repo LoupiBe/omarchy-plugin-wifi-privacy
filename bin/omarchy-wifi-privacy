@@ -1,0 +1,261 @@
+#!/bin/bash
+# omarchy-wifi-privacy: CLI tool for Wi-Fi identity randomization, MAC spoofing, and hostname privacy.
+# Hardened according to Omarchy Marketplace Producer-Side Bounds.
+
+export PATH="/usr/bin:/bin:/usr/local/bin"
+export LC_ALL=C
+set -euo pipefail
+
+# Bound total output lines (max 128) and bytes (max 8192)
+exec 1> >(head -n 128 | head -c 8192)
+trap "exec 1>&-; wait" EXIT
+
+get_wifi_iface() {
+  local iface
+  iface=$(timeout 2s nmcli -t -f DEVICE,TYPE device status 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}' || true)
+  echo "${iface:0:32}"
+}
+
+get_active_wifi_conn() {
+  local iface="$1"
+  [[ -z "$iface" ]] && echo "" && return
+  local conn
+  conn=$(timeout 2s nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | awk -F: -v dev="$iface" '$2==dev{print $1; exit}' || true)
+  echo "${conn:0:64}"
+}
+
+get_active_wifi_uuid() {
+  local iface="$1"
+  [[ -z "$iface" ]] && echo "" && return
+  local uuid
+  uuid=$(timeout 2s nmcli -t -f UUID,DEVICE connection show --active 2>/dev/null | awk -F: -v dev="$iface" '$2==dev{print $1; exit}' || true)
+  echo "${uuid:0:64}"
+}
+
+generate_fake_hostname() {
+  local prefix="LAPTOP"
+  local rand_id
+  rand_id=$(head -c 16 /dev/urandom 2>/dev/null | tr -dc 'A-Z0-9' | head -c 6 || true)
+  if [[ ${#rand_id} -lt 6 ]]; then
+    rand_id=$(printf '%04X%02X' "$RANDOM" "$((RANDOM % 256))")
+  fi
+  echo "${prefix}-${rand_id:0:6}"
+}
+
+cmd_status() {
+  local json_mode=0
+  if [[ "${1:-}" == "--json" || "${1:-}" == "-j" ]]; then
+    json_mode=1
+  fi
+
+  local iface conn_name conn_uuid hw_mac current_mac
+  local cloned_mac dhcp_host real_host is_trusted is_mac_rand ipv6_temp avahi_hidden
+
+  iface=$(get_wifi_iface)
+  real_host=$(head -n 1 /etc/hostname 2>/dev/null || hostname 2>/dev/null || echo "unknown")
+  real_host="${real_host:0:64}"
+
+  if [[ -z "$iface" ]]; then
+    if (( json_mode )); then
+      echo '{"active":false,"error":"No Wi-Fi interface detected"}'
+    else
+      echo "No active Wi-Fi interface detected."
+    fi
+    return 0
+  fi
+
+  conn_name=$(get_active_wifi_conn "$iface")
+  conn_uuid=$(get_active_wifi_uuid "$iface")
+
+  # Hardware permanent MAC bounded with timeout
+  hw_mac=$(timeout 2s ethtool -P "$iface" 2>/dev/null | awk '{print $3}' || true)
+  if [[ -z "$hw_mac" || "$hw_mac" == "Cannot"* ]]; then
+    hw_mac=$(cat "/sys/class/net/$iface/address" 2>/dev/null || echo "unknown")
+  fi
+  hw_mac="${hw_mac:0:32}"
+
+  # Current active MAC bounded with timeout
+  current_mac=$(timeout 2s ip link show "$iface" 2>/dev/null | awk '/link\/ether/ {print $2}' || echo "unknown")
+  current_mac="${current_mac:0:32}"
+
+  if [[ -n "$conn_uuid" ]]; then
+    cloned_mac=$(timeout 2s nmcli -g 802-11-wireless.cloned-mac-address connection show "$conn_uuid" 2>/dev/null || true)
+    dhcp_host=$(timeout 2s nmcli -g ipv4.dhcp-hostname connection show "$conn_uuid" 2>/dev/null || true)
+  else
+    cloned_mac=""
+    dhcp_host=""
+  fi
+  dhcp_host="${dhcp_host:0:64}"
+
+  if [[ "$cloned_mac" == "preserve" ]]; then
+    is_trusted=true
+  else
+    is_trusted=false
+  fi
+
+  if [[ -n "$current_mac" && -n "$hw_mac" && "$current_mac" != "$hw_mac" && "$current_mac" != "unknown" ]]; then
+    is_mac_rand=true
+  else
+    is_mac_rand=false
+  fi
+
+  # IPv6 privacy bounded with timeout
+  local tempaddr
+  tempaddr=$(timeout 2s sysctl -n "net.ipv6.conf.${iface}.use_tempaddr" 2>/dev/null || echo "0")
+  if [[ "$tempaddr" == "2" ]]; then
+    ipv6_temp=true
+  else
+    ipv6_temp=false
+  fi
+
+  # Avahi mDNS publishing status
+  if grep -qE "^\s*disable-publishing\s*=\s*yes" /etc/avahi/avahi-daemon.conf 2>/dev/null; then
+    avahi_hidden=true
+  else
+    avahi_hidden=false
+  fi
+
+  # Clean values for JSON output (escaping quotes and backslashes)
+  local safe_conn_name="${conn_name//\\/\\\\}"
+  safe_conn_name="${safe_conn_name//\"/\\\"}"
+  local safe_dhcp_host="${dhcp_host//\\/\\\\}"
+  safe_dhcp_host="${safe_dhcp_host//\"/\\\"}"
+  local safe_real_host="${real_host//\\/\\\\}"
+  safe_real_host="${safe_real_host//\"/\\\"}"
+
+  if (( json_mode )); then
+    cat <<EOF
+{
+  "active": $( [[ -n "$conn_name" ]] && echo "true" || echo "false" ),
+  "iface": "$iface",
+  "ssid": "${safe_conn_name}",
+  "uuid": "${conn_uuid}",
+  "hw_mac": "${hw_mac}",
+  "current_mac": "${current_mac}",
+  "is_mac_randomized": ${is_mac_rand},
+  "is_trusted": ${is_trusted},
+  "real_hostname": "${safe_real_host}",
+  "dhcp_hostname": "${safe_dhcp_host:-$safe_real_host}",
+  "ipv6_tempaddr": ${ipv6_temp},
+  "avahi_hidden": ${avahi_hidden}
+}
+EOF
+  else
+    echo "=== Wi-Fi Privacy Status ==="
+    echo "Interface:        $iface"
+    echo "Connected Wi-Fi:  ${conn_name:-<disconnected>}"
+    echo "Network Type:     $([ "$is_trusted" = true ] && echo 'Trusted (Hardware MAC)' || echo 'Untrusted (Randomized identity)')"
+    echo "Active MAC:       $current_mac $([ "$is_mac_rand" = true ] && echo '[Randomized]' || echo '[Hardware Permanent]')"
+    echo "Hardware MAC:     $hw_mac"
+    echo "DHCP Hostname:    ${dhcp_host:-$real_host} $([ -n "$dhcp_host" ] && echo '[Cloaked]' || echo '[System Default]')"
+    echo "IPv6 Privacy:     $([ "$ipv6_temp" = true ] && echo 'Enabled (RFC 4941 temporary addresses)' || echo 'Disabled')"
+    echo "mDNS Broadcast:   $([ "$avahi_hidden" = true ] && echo 'Hidden (disable-publishing=yes)' || echo 'Active (advertising on LAN)')"
+  fi
+}
+
+cmd_trust() {
+  local target="${1:-}"
+  local iface conn_uuid
+  iface=$(get_wifi_iface)
+
+  if [[ -z "$target" ]]; then
+    conn_uuid=$(get_active_wifi_uuid "$iface")
+    [[ -z "$conn_uuid" ]] && { echo "Error: No active Wi-Fi connection and no SSID specified." >&2; exit 1; }
+  else
+    conn_uuid=$(timeout 2s nmcli -t -f UUID,NAME connection show 2>/dev/null | awk -F: -v name="$target" '$2==name{print $1; exit}' || true)
+    [[ -z "$conn_uuid" ]] && { echo "Error: Connection '$target' not found." >&2; exit 1; }
+  fi
+
+  echo "Marking connection as TRUSTED (preserving hardware MAC & real hostname)..."
+  timeout 5s nmcli connection modify "$conn_uuid" \
+    802-11-wireless.cloned-mac-address "preserve" \
+    ipv4.dhcp-send-hostname "true" \
+    ipv6.dhcp-send-hostname "true" \
+    ipv4.dhcp-hostname "" \
+    ipv6.dhcp-hostname ""
+
+  if [[ -n "$iface" ]]; then
+    timeout 5s nmcli device reapply "$iface" 2>/dev/null || true
+  fi
+  echo "Done. Connection is now marked as trusted."
+}
+
+cmd_untrust() {
+  local target="${1:-}"
+  local iface conn_uuid fake_name
+  iface=$(get_wifi_iface)
+
+  if [[ -z "$target" ]]; then
+    conn_uuid=$(get_active_wifi_uuid "$iface")
+    [[ -z "$conn_uuid" ]] && { echo "Error: No active Wi-Fi connection and no SSID specified." >&2; exit 1; }
+  else
+    conn_uuid=$(timeout 2s nmcli -t -f UUID,NAME connection show 2>/dev/null | awk -F: -v name="$target" '$2==name{print $1; exit}' || true)
+    [[ -z "$conn_uuid" ]] && { echo "Error: Connection '$target' not found." >&2; exit 1; }
+  fi
+
+  fake_name=$(generate_fake_hostname)
+  echo "Marking connection as UNTRUSTED (randomized MAC & cloaked hostname: $fake_name)..."
+  timeout 5s nmcli connection modify "$conn_uuid" \
+    802-11-wireless.cloned-mac-address "random" \
+    ipv4.dhcp-send-hostname "true" \
+    ipv6.dhcp-send-hostname "true" \
+    ipv4.dhcp-hostname "$fake_name" \
+    ipv6.dhcp-hostname "$fake_name"
+
+  echo "Re-activating connection to apply new identity..."
+  timeout 10s nmcli connection up "$conn_uuid" 2>/dev/null || true
+  echo "Done. Connected with randomized MAC and hostname '$fake_name'."
+}
+
+cmd_randomize() {
+  local iface conn_uuid fake_name
+  iface=$(get_wifi_iface)
+  conn_uuid=$(get_active_wifi_uuid "$iface")
+  [[ -z "$conn_uuid" ]] && { echo "Error: No active Wi-Fi connection." >&2; exit 1; }
+
+  fake_name=$(generate_fake_hostname)
+  echo "Rotating identity -> Fresh random MAC and new hostname: $fake_name..."
+  timeout 5s nmcli connection modify "$conn_uuid" \
+    802-11-wireless.cloned-mac-address "random" \
+    ipv4.dhcp-send-hostname "true" \
+    ipv6.dhcp-send-hostname "true" \
+    ipv4.dhcp-hostname "$fake_name" \
+    ipv6.dhcp-hostname "$fake_name"
+
+  timeout 10s nmcli connection up "$conn_uuid" 2>/dev/null || true
+  echo "Identity rotated successfully."
+}
+
+case "${1:-status}" in
+  status)
+    shift
+    cmd_status "$@"
+    ;;
+  trust)
+    shift
+    cmd_trust "$@"
+    ;;
+  untrust)
+    shift
+    cmd_untrust "$@"
+    ;;
+  randomize)
+    shift
+    cmd_randomize "$@"
+    ;;
+  help|--help|-h)
+    cat <<USAGE
+Usage: omarchy-wifi-privacy <command> [arguments]
+
+Commands:
+  status [--json]       Display current Wi-Fi privacy and identity status
+  trust [SSID]          Mark current or specified Wi-Fi network as trusted (use hardware MAC)
+  untrust [SSID]        Mark network as untrusted (random MAC + cloaked hostname)
+  randomize             Force a fresh randomized MAC and cloaked hostname immediately
+USAGE
+    ;;
+  *)
+    echo "Unknown command: $1 (see --help)" >&2
+    exit 1
+    ;;
+esac

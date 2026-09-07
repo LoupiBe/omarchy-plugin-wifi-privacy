@@ -1,0 +1,50 @@
+name: CI & Marketplace Hardening Checks
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  validate-and-test:
+    name: Validate Plugin & Run Security Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Validate Plugin Manifest Schema
+        run: |
+          MANIFEST="manifest.json"
+          echo "Validating $MANIFEST..."
+          jq -e '.schemaVersion == 1' "$MANIFEST" >/dev/null || (echo "Invalid schemaVersion" && exit 1)
+          for field in id name version kinds entryPoints; do
+            jq -e --arg f "$field" 'has($f)' "$MANIFEST" >/dev/null || (echo "Missing field: $field" && exit 1)
+          done
+          ID=$(jq -r '.id' "$MANIFEST")
+          [[ $ID =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || (echo "Invalid ID format" && exit 1)
+          [[ $ID != omarchy.* ]] || (echo "Reserved omarchy namespace" && exit 1)
+          EP=$(jq -r '.entryPoints.barWidget' "$MANIFEST")
+          [[ -f "$EP" ]] || (echo "Entry point not found: $EP" && exit 1)
+          echo "Manifest validation passed successfully!"
+
+      - name: Run Security & Regression Test Suite
+        run: node test.js
+
+      - name: Verify Executable Permissions
+        run: |
+          test -x bin/omarchy-wifi-privacy
+          test -x install.sh
+          test -x uninstall.sh
+          test -x system/10-dhcp-hostname-privacy.sh
+          echo "All scripts have proper execution permissions."
